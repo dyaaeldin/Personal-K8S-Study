@@ -1,0 +1,178 @@
+pipeline {
+    agent any
+    environment {
+
+      // Define Application name
+      APP_NAME = "demo-app"
+
+      // Define the CD helm repo
+      HELM_REPO = "github.com/dyaaeldin/generic-helm.git"
+      CONF_REPO = "github.com/dyaaeldin/app-conf.git"
+
+      // Docker registry Envs
+      DOCKER_REGISTRY = "registry.dyaa.local"
+      DOCKER_REPO = "demo"
+      
+      // Artifactory Envs
+      ARTIFACTORY_SERVER = 'https://jfrog.dyaa.local/artifactory/'
+      ARTIFACTORY_REPO = 'demo-app'
+      CI = true
+      ARTIFACTORY_ACCESS_TOKEN = credentials('artifactory-credentials')
+      
+      // Sonar qube Envs
+      SONAR_PROJECT_KEY= 'demo-app'
+      SONAR_HOST = 'https://sonar.dyaa.local'
+      
+    }
+    tools {
+        maven '3.9.2'
+        jdk 'java17'
+    }
+    stages {
+        
+       stage('Build Application') {
+            steps {
+                script{
+                    sh ' mvn clean install -DskipTests'
+                }
+            }
+        }
+
+        stage('Upload to Artifactory') {
+          agent {
+            docker {
+              image 'releases-docker.jfrog.io/jfrog/jfrog-cli-v2:2.2.0' 
+              reuseNode true
+            }
+          }
+          steps {
+            sh 'jfrog rt upload --url ${ARTIFACTORY_SERVER} --access-token ${ARTIFACTORY_ACCESS_TOKEN} target/*.jar ${ARTIFACTORY_REPO}/'
+          }
+        }
+        /*
+        stage('Code Quality Analysis') {
+            steps{
+                script {
+                   scannerHome = tool 'sonar'
+                }
+                withSonarQubeEnv('sonar') {
+                   sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.java.binaries=\"target/classes\""
+                }
+            }
+       }
+       // Tests will be added
+       
+       stage('Unit Testing') {
+            steps {
+                script{
+                    sh 'mvn test'
+                }
+            }
+        }
+       stage('Integration Testing') {
+            steps {
+                script{
+                    sh 'mvn clean install -DskipUnitTests'
+                }
+            }
+        }
+        */
+        stage ('Build Docker image') {
+            steps{
+                script{
+                        if (env.BRANCH_NAME == "develop" || env.BRANCH_NAME == "staging" || env.BRANCH_NAME == "testing") {
+                            sh "docker build -t ${DOCKER_REGISTRY}/${DOCKER_REPO}/${APP_NAME}:${env.BRANCH_NAME}-${env.BUILD_NUMBER} ."
+                        } 
+                        else{
+                            echo "Skip Branch"
+                        }              
+                }
+            }
+        
+        }
+        stage('Push Docker image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-registry-credentials', passwordVariable: 'DOCKER_REGISTRY_PASSWORD', usernameVariable: 'DOCKER_REGISTRY_USERNAME')]) {
+                    script {
+                        if (env.BRANCH_NAME == "develop" || env.BRANCH_NAME == "staging" || env.BRANCH_NAME == "testing") {
+                            sh "docker login -u ${DOCKER_REGISTRY_USERNAME} -p ${DOCKER_REGISTRY_PASSWORD} ${DOCKER_REGISTRY}"
+                            sh "docker push ${DOCKER_REGISTRY}/${DOCKER_REPO}/${APP_NAME}:${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
+                        }
+                        else {
+                            echo "Skip Branch"
+                        }
+                    }
+                }
+            }
+        } 
+        
+        stage('Configure Helm authentication'){
+            steps{
+                withCredentials([string(credentialsId: 'kubeconfig', variable: 'KC')]) {
+                    script{
+                        if (env.BRANCH_NAME == "develop" || env.BRANCH_NAME == "staging" || env.BRANCH_NAME == "testing") {
+                            sh """
+                            echo ${KC} | base64 -d > kubeconfig.yaml
+                            chmod 0400 kubeconfig.yaml
+                            helm --kubeconfig=kubeconfig.yaml -n main ls
+                            """
+                        }
+                        else {
+                            echo "Skip Branch"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Check Helm Changes'){
+            steps{
+                withCredentials([usernamePassword(credentialsId: 'cred-bitbucket', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
+                    script{
+                        if (env.BRANCH_NAME == "develop" || env.BRANCH_NAME == "staging" || env.BRANCH_NAME == "testing") {  
+                                sh "git clone -b main https://gituser:${GIT_PASS}@${HELM_REPO} helm"
+                                sh "git clone -b ${APP_NAME}_${env.BRANCH_NAME} https://gituser:${GIT_PASS}@${CONF_REPO} values"
+                                sh """ sed -i "s/tag: latest/tag: \"${env.BRANCH_NAME}-${env.BUILD_NUMBER}\"/g" values/values.yaml """
+                                sh "[ -f values/properties ] && cp values/properties ./helm"
+                                sh "helm --kubeconfig=kubeconfig.yaml -n ${env.BRANCH_NAME} diff upgrade --install ${APP_NAME} -f values/values.yaml ./helm"
+                        }
+                        else {
+                            echo "Skip Branch"
+                        }
+                    }
+                }
+            }
+
+        }
+        stage('Apply helm changes'){
+            steps{
+                withCredentials([usernamePassword(credentialsId: 'bitbucket', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
+                    script{
+                        if (env.BRANCH_NAME == "develop" || env.BRANCH_NAME == "staging" || env.BRANCH_NAME == "testing") {
+                            if (env.BRANCH_NAME == "staging" || env.BRANCH_NAME == "testing") {
+                                input(id: 'deployApproval', message: 'Approve deployment?', ok: 'Deploy')
+                            }    
+                                sh "helm --kubeconfig=kubeconfig.yaml -n ${env.BRANCH_NAME} upgrade --install ${APP_NAME} -f values/values.yaml ./helm"
+                        }
+                        else {
+                            echo "Skip Branch"
+                        }
+                    }
+                }
+            }
+
+        }
+        
+        stage('Remove Unused docker image ') {
+            steps {
+                sh 'docker image prune -a -f --filter "until=24h"'
+            }
+        }
+    }
+        
+    post {
+        always {
+            deleteDir()
+        }
+    }
+}
